@@ -1,1 +1,12 @@
-# -workflows-bot.yml
+{
+"name": "threads-bot",
+"on": {"schedule": [{"cron": "*/15 * * * *"}], "workflow_dispatch": {}},
+"permissions": {"contents": "write"},
+"concurrency": {"group": "threads-bot", "cancel-in-progress": false},
+"jobs": {"run": {"runs-on": "ubuntu-latest", "steps": [
+{"uses": "actions/checkout@v4"},
+{"uses": "actions/setup-python@v5", "with": {"python-version": "3.12"}},
+{"name": "Run bot", "run": "python bot.py --once", "env": {"THREADS_TOKEN": "${{ secrets.THREADS_TOKEN }}", "TELEGRAM_TOKEN": "${{ secrets.TELEGRAM_TOKEN }}", "TELEGRAM_CHAT_ID": "${{ secrets.TELEGRAM_CHAT_ID }}", "ITEMS": "${{ vars.ITEMS }}"}},
+{"name": "Save seen posts", "run": "git config user.name threads-bot && git config user.email threads-bot@users.noreply.github.com && git add seen.json && (git diff --cached --quiet || (git commit -m 'update seen' && git push))"}
+]}}
+}
