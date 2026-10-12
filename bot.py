@@ -1,356 +1,398 @@
 #!/usr/bin/env python3
-# -*- coding: utf-8 -*-
 
 import os
 import re
+import sys
 import json
 import time
 import html
-import hashlib
 import urllib.parse
 import urllib.request
-import urllib.error
-from pathlib import Path
 from html.parser import HTMLParser
+from pathlib import Path
 
-# ==========================================
-# CONFIG
-# ==========================================
+BOT_NAME = "Vintage Monitor"
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
 
 SEEN_FILE = Path(os.getenv("SEEN_FILE", "seen.json"))
-MAX_RESULTS_PER_QUERY = 15
+MAX_SEEN = 5000
 
 SEARCH_TERMS = [
     '"ищу секонд хенд"',
     '"ищу секонд-хенд"',
     '"ищу винтажную одежду"',
+    '"куплю винтажную одежду"',
+    '"продам винтажную одежду"',
+    '"винтажная одежда купить"',
+    '"одежда секонд хенд"',
+    '"винтажный магазин одежда"',
+    '"куплю одежду бу"',
+    '"продам одежду бу"',
     '"ищу винтаж"',
-    '"где купить винтаж"',
-    '"посоветуйте секонд хенд"',
-    '"ищу одежду бу"',
-    '"где найти винтажную одежду"',
-    '"ищу винтажный магазин"',
-    '"ищу винтажную куртку"',
-    '"ищу винтажные джинсы"',
-    '"looking for vintage clothes"',
-    '"looking for second hand clothes"',
-    '"recommend a thrift store"',
+    '"ищу одежду vintage"',
+    '"second hand clothes Russia"',
+    '"vintage clothing Russia"',
 ]
 
-SITES = [
-    "site:threads.com",
-    "site:threads.net",
+DOMAINS = [
+    "threads.com",
+    "threads.net",
 ]
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/131.0.0.0 Safari/537.36"
+    ),
+    "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
+}
 
 CLOTHING_RE = re.compile(
+    r"\b("
+    r"винтаж\w*|vintage|"
     r"секонд[\s-]?хенд|second[\s-]?hand|"
-    r"винтаж\w*|vintage|thrift|"
     r"одежд\w*|clothes|clothing|"
-    r"куртк\w*|джинс\w*|юбк\w*|"
-    r"пальто|плать\w*|брюк\w*|"
-    r"рубашк\w*|сумк\w*|обув\w*|"
-    r"барахолк\w*|комиссионк\w*",
+    r"куртк\w*|пальто|джинс\w*|"
+    r"юбк\w*|плать\w*|"
+    r"рубашк\w*|брюк\w*|"
+    r"обув\w*|сумк\w*|"
+    r"thrift|барахолк\w*|"
+    r"бу вещ\w*|б/у"
+    r")\b",
     re.IGNORECASE,
 )
 
 INTENT_RE = re.compile(
-    r"ищу|ищем|ищется|подскаж\w*|посовет\w*|"
-    r"где\s+(можно\s+)?(купить|найти|взять)|"
-    r"кто\s+(знает|может)|не\s+знаете|"
-    r"нужн\w*|хочу\s+купить|"
-    r"looking\s+for|anyone\s+know|"
-    r"recommend\w*|where\s+(can|to)|"
-    r"ищу\s+магазин|"
-    r"где\s+одеваться",
+    r"\b("
+    r"ищу|куплю|продам|продаю|"
+    r"купить|продажа|найти|"
+    r"посоветуйте|подскажите|"
+    r"где купить|где найти|"
+    r"нужен|нужна|нужно|"
+    r"ищем|отдам|обмен|"
+    r"looking for|buy|sell|"
+    r"for sale|where to buy|"
+    r"second hand|thrift"
+    r")\b",
     re.IGNORECASE,
 )
 
-# ==========================================
-# HTML PARSER
-# ==========================================
 
-class SearchParser(HTMLParser):
-    def __init__(self):
-        super().__init__()
-        self.results = []
-        self.current = None
-        self.capture = None
-
-    def handle_starttag(self, tag, attrs):
-        attrs = dict(attrs)
-        classes = attrs.get("class", "")
-
-        if tag == "a" and "result__a" in classes:
-            self.current = {
-                "url": attrs.get("href", ""),
-                "title": "",
-                "snippet": "",
-            }
-            self.capture = "title"
-
-        elif tag in ("a", "div", "td") and (
-            "result__snippet" in classes
-        ):
-            if self.results:
-                self.capture = "snippet"
-
-    def handle_data(self, data):
-        text = data.strip()
-        if not text or not self.results and not self.current:
-            return
-
-        if self.current and self.capture == "title":
-            self.current["title"] += " " + text
-
-        elif self.results and self.capture == "snippet":
-            self.results[-1]["snippet"] += " " + text
-
-    def handle_endtag(self, tag):
-        if tag == "a" and self.current:
-            result = self.current
-            result["title"] = result["title"].strip()
-            result["snippet"] = result["snippet"].strip()
-            self.results.append(result)
-            self.current = None
-            self.capture = None
+def log(message):
+    print(message, flush=True)
 
 
-# ==========================================
-# HTTP
-# ==========================================
+def load_seen():
+    try:
+        data = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
+        if isinstance(data, list):
+            return set(str(item) for item in data)
+    except (OSError, ValueError):
+        pass
 
-def get_page(url, timeout=25):
-    request = urllib.request.Request(
-        url,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/130.0.0.0 Safari/537.36"
-            ),
-            "Accept": "text/html,application/xhtml+xml",
-            "Accept-Language": "ru-RU,ru;q=0.9,en;q=0.8",
-        },
+    return set()
+
+
+def save_seen(seen):
+    SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    items = sorted(seen)[-MAX_SEEN:]
+
+    SEEN_FILE.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
     )
 
-    with urllib.request.urlopen(request, timeout=timeout) as response:
-        return response.read().decode("utf-8", errors="replace")
+
+def telegram_send(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log(
+            "ERROR: TELEGRAM_TOKEN или TELEGRAM_CHAT_ID "
+            "не настроен в GitHub Secrets."
+        )
+        return False
+
+    url = (
+        "https://api.telegram.org/bot"
+        + TELEGRAM_TOKEN
+        + "/sendMessage"
+    )
+
+    payload = urllib.parse.urlencode({
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message,
+        "disable_web_page_preview": "true",
+    }).encode("utf-8")
+
+    request = urllib.request.Request(
+        url,
+        data=payload,
+        headers={
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "VintageMonitor/1.0",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            result = json.loads(response.read().decode("utf-8"))
+
+        if result.get("ok"):
+            return True
+
+        log("Telegram API error: " + str(result.get("description")))
+        return False
+
+    except Exception as exc:
+        log(f"Telegram sending error: {exc}")
+        return False
 
 
-# ==========================================
-# DUCKDUCKGO SEARCH
-# ==========================================
-
-def normalize_result_url(url):
+def unwrap_url(url):
     url = html.unescape(url.strip())
 
     if url.startswith("//"):
         url = "https:" + url
 
-    if "duckduckgo.com/l/?" in url:
-        parsed = urllib.parse.urlparse(url)
-        params = urllib.parse.parse_qs(parsed.query)
-        url = params.get("uddg", [url])[0]
+    parsed = urllib.parse.urlparse(url)
 
-    return url
+    if "duckduckgo.com" in parsed.netloc.lower():
+        params = urllib.parse.parse_qs(parsed.query)
+        targets = params.get("uddg", [])
+
+        if targets:
+            url = targets[0]
+            parsed = urllib.parse.urlparse(url)
+
+    return urllib.parse.urlunparse(parsed._replace(fragment=""))
 
 
 def is_threads_url(url):
     try:
-        host = urllib.parse.urlparse(url).netloc.lower()
-        return (
-            host == "threads.com"
-            or host.endswith(".threads.com")
-            or host == "threads.net"
-            or host.endswith(".threads.net")
-        )
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.netloc.lower().split(":")[0]
+
+        if host not in ("threads.com", "www.threads.com",
+                        "threads.net", "www.threads.net"):
+            return False
+
+        return "/post/" in parsed.path or "/@" in parsed.path
+
     except Exception:
         return False
 
 
-def search_web(term, site):
-    query = f"{site} {term}"
-    url = (
-        "https://html.duckduckgo.com/html/?"
-        + urllib.parse.urlencode({"q": query})
-    )
+class SearchParser(HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results = []
+        self.current = None
+        self.capture_title = False
+        self.capture_snippet = False
 
-    print(f"Searching web: {query}")
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "")
+        href = attrs.get("href", "")
 
-    page = get_page(url)
-    parser = SearchParser()
-    parser.feed(page)
+        if tag == "a" and "result__a" in classes.split():
+            if self.current:
+                self.results.append(self.current)
 
-    results = []
+            self.current = {
+                "url": unwrap_url(href),
+                "title": "",
+                "snippet": "",
+            }
+            self.capture_title = True
+            self.capture_snippet = False
 
-    for item in parser.results[:MAX_RESULTS_PER_QUERY]:
-        link = normalize_result_url(item["url"])
-        title = html.unescape(item["title"]).strip()
-        snippet = html.unescape(item["snippet"]).strip()
+        elif tag in ("a", "div", "td") and (
+            "result__snippet" in classes.split()
+        ):
+            if self.current:
+                self.capture_snippet = True
+                self.capture_title = False
 
-        if not is_threads_url(link):
-            continue
+    def handle_data(self, data):
+        if not self.current:
+            return
 
-        text = f"{title}\n{snippet}".strip()
+        text = data.strip()
 
         if not text:
-            continue
+            return
 
-        if not CLOTHING_RE.search(text):
-            continue
+        if self.capture_title:
+            self.current["title"] += " " + text
 
-        if not INTENT_RE.search(text):
-            continue
+        elif self.capture_snippet:
+            self.current["snippet"] += " " + text
 
-        post_id = hashlib.sha256(
-            link.encode("utf-8")
-        ).hexdigest()[:24]
+    def handle_endtag(self, tag):
+        if tag == "a" and self.capture_title:
+            self.capture_title = False
 
-        results.append({
-            "id": post_id,
-            "url": link,
-            "text": text,
-        })
+        if tag in ("a", "div", "td") and self.capture_snippet:
+            self.capture_snippet = False
 
-    print(f"Search results accepted: {len(results)}")
-    return results
+    def finish(self):
+        if self.current:
+            self.results.append(self.current)
+            self.current = None
+
+        return self.results
 
 
-# ==========================================
-# TELEGRAM
-# ==========================================
+def duckduckgo_search(query):
+    url = "https://html.duckduckgo.com/html/?" + urllib.parse.urlencode({
+        "q": query,
+        "kl": "ru-ru",
+    })
 
-def send_telegram(message):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        print("ERROR: Telegram secrets are not configured.")
-        return False
-
-    url = (
-        f"https://api.telegram.org/bot"
-        f"{TELEGRAM_TOKEN}/sendMessage"
+    request = urllib.request.Request(
+        url,
+        headers=HEADERS,
     )
 
-    data = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message[:4000],
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-
-    request = urllib.request.Request(url, data=data)
-
     try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            result = json.loads(
-                response.read().decode("utf-8")
-            )
+        with urllib.request.urlopen(request, timeout=25) as response:
+            status = response.status
+            page = response.read().decode("utf-8", errors="replace")
 
-        if result.get("ok"):
-            return True
+        log(f"  Search HTTP status: {status}")
+        log(f"  HTML received: {len(page)} characters")
 
-        print("Telegram error:", result)
+        if "anomaly-modal" in page.lower():
+            log("  WARNING: Search engine may be blocking automated requests.")
+
+        parser = SearchParser()
+        parser.feed(page)
+        results = parser.finish()
+
+        log(f"  Search results parsed: {len(results)}")
+        return results
+
+    except Exception as exc:
+        log(f"  SEARCH ERROR: {type(exc).__name__}: {exc}")
+        return []
+
+
+def relevant_post(title, snippet):
+    text = f"{title} {snippet}"
+
+    if not CLOTHING_RE.search(text):
         return False
 
-    except Exception as error:
-        print("Telegram send error:", error)
-        return False
+    # Поисковый запрос уже тематический.
+    # Нам не обязательно требовать слова «ищу»:
+    # объявления о продаже тоже представляют интерес.
+    return True
 
 
-# ==========================================
-# STATE
-# ==========================================
-
-def load_seen():
-    if not SEEN_FILE.exists():
-        return set()
-
-    try:
-        with SEEN_FILE.open("r", encoding="utf-8") as file:
-            data = json.load(file)
-
-        if isinstance(data, dict):
-            return set(data.get("ids", []))
-
-        if isinstance(data, list):
-            return set(data)
-
-    except Exception as error:
-        print("Could not read seen file:", error)
-
-    return set()
-
-
-def save_seen(ids):
-    state = {"ids": list(ids)[-10000:]}
-    temporary = SEEN_FILE.with_suffix(".tmp")
-
-    with temporary.open("w", encoding="utf-8") as file:
-        json.dump(state, file, ensure_ascii=False)
-
-    temporary.replace(SEEN_FILE)
-
-
-# ==========================================
-# MAIN
-# ==========================================
-
-def run_once():
-    seen = load_seen()
+def search_all():
     found = {}
 
     for term in SEARCH_TERMS:
-        for site in SITES:
-            try:
-                posts = search_web(term, site)
+        for domain in DOMAINS:
+            query = f"site:{domain} {term}"
 
-                for post in posts:
-                    found[post["id"]] = post
+            log(f"\nSearching web: {query}")
 
-            except Exception as error:
-                print(
-                    f"Search failed for {site} {term}: {error}"
-                )
+            results = duckduckgo_search(query)
 
+            for item in results:
+                url = unwrap_url(item.get("url", ""))
+
+                if not is_threads_url(url):
+                    continue
+
+                title = " ".join(item.get("title", "").split())
+                snippet = " ".join(item.get("snippet", "").split())
+
+                if not relevant_post(title, snippet):
+                    continue
+
+                found[url] = {
+                    "url": url,
+                    "title": title or "Публикация Threads",
+                    "snippet": snippet,
+                    "query": term,
+                }
+
+            # Небольшая пауза между запросами.
             time.sleep(2)
 
-    if not found:
-        print(
-            "No matching public Threads posts found. "
-            "This does not prove that no matching posts exist."
-        )
-        return
+    return list(found.values())
 
-    new_posts = [
-        post for post_id, post in found.items()
-        if post_id not in seen
-    ]
+
+def format_message(post):
+    title = post["title"][:350]
+    snippet = post["snippet"][:500]
+
+    return (
+        "🧥 Найдена публикация о винтаже / секонд-хенде\n\n"
+        f"📌 {title}\n\n"
+        f"{snippet}\n\n"
+        f"🔗 {post['url']}"
+    )
+
+
+def main():
+    log("=" * 45)
+    log(f"{BOT_NAME} started")
+    log("Search engine: DuckDuckGo HTML")
+    log("Threads API: not used")
+    log("=" * 45)
+
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log(
+            "WARNING: Telegram secrets are missing. "
+            "Search can run, but notifications will not be sent."
+        )
+
+    seen = load_seen()
+    log(f"Previously recorded links: {len(seen)}")
+
+    posts = search_all()
+
+    log("\n" + "=" * 45)
+    log(f"Unique matching Threads posts: {len(posts)}")
+
+    new_posts = [post for post in posts if post["url"] not in seen]
+
+    log(f"New posts: {len(new_posts)}")
 
     sent = 0
+    failed = 0
 
     for post in new_posts:
-        message = (
-            "🧥 Найдена публикация о винтаже / секонд-хенде\n\n"
-            f"{post['text']}\n\n"
-            f"Источник: {post['url']}"
-        )
+        log(f"Processing: {post['url']}")
 
-        if send_telegram(message):
-            seen.add(post["id"])
+        if telegram_send(format_message(post)):
             sent += 1
+            seen.add(post["url"])
+            log("  Telegram: SENT")
+        else:
+            failed += 1
+            log("  Telegram: FAILED")
 
         time.sleep(1)
 
     save_seen(seen)
 
-    print(
-        f"Results: {len(found)} | "
-        f"New: {len(new_posts)} | "
-        f"Sent: {sent}"
-    )
+    log("\n" + "=" * 45)
+    log(f"Search results: {len(posts)}")
+    log(f"New posts: {len(new_posts)}")
+    log(f"Sent to Telegram: {sent}")
+    log(f"Failed notifications: {failed}")
+    log("Finished")
+    log("=" * 45)
 
 
 if __name__ == "__main__":
-    print("Vintage Monitor started")
-    run_once()
+    main()
