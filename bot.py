@@ -3,29 +3,18 @@
 
 """
 VINTAGE CLIENT FINDER
-Поиск потенциальных покупателей винтажной одежды.
+Поиск публичных публикаций с потенциальными покупателями винтажной одежды.
 
 Источники:
-- Bing RSS search
-- DuckDuckGo HTML search, если доступен
-- Avito, Юла и другие площадки через индексируемые страницы
-- VK API (опционально)
-- YouTube Data API (опционально)
-- Reddit public search (опционально)
-- Публичные Telegram-каналы, указанные в настройках
-- Дополнительные RSS-ленты
+- DuckDuckGo HTML
+- Bing RSS
+- YouTube Data API
+- VK API
+- Reddit public search
+- Публичные Telegram-каналы
+- Дополнительные RSS
 
-Переменные GitHub Actions:
-TELEGRAM_TOKEN
-TELEGRAM_CHAT_ID
-VK_TOKEN                 (необязательно)
-YOUTUBE_API_KEY          (необязательно)
-TELEGRAM_CHANNELS        (необязательно, через запятую)
-EXTRA_RSS                (необязательно, RSS URL через запятую)
-MAX_QUERIES              (необязательно, по умолчанию 24)
-REQUEST_DELAY            (необязательно, по умолчанию 0.4)
-
-Используются только доступные публичные источники.
+Threads API не используется.
 """
 
 import os
@@ -34,289 +23,375 @@ import json
 import time
 import html
 import hashlib
+import logging
 import urllib.parse
 import urllib.request
 import urllib.error
 import xml.etree.ElementTree as ET
 
-from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 # ============================================================
-# CONFIG
+# CONFIGURATION
 # ============================================================
 
-BASE_DIR = Path(__file__).resolve().parent
-SEEN_FILE = BASE_DIR / "seen.json"
+TELEGRAM_TOKEN = (
+    os.getenv("TELEGRAM_TOKEN")
+    or os.getenv("TG_TOKEN")
+    or ""
+).strip()
 
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN", "").strip()
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+TELEGRAM_CHAT_ID = (
+    os.getenv("TELEGRAM_CHAT_ID")
+    or os.getenv("TG_CHAT")
+    or ""
+).strip()
 
 VK_TOKEN = os.getenv("VK_TOKEN", "").strip()
 YOUTUBE_API_KEY = os.getenv("YOUTUBE_API_KEY", "").strip()
 
+SEEN_FILE = Path("seen.json")
+STATE_FILE = Path("search_state.json")
+LOG_FILE = Path("monitor.log")
+
+MAX_QUERIES = int(os.getenv("MAX_QUERIES", "35"))
+MAX_ALERTS_PER_RUN = int(os.getenv("MAX_ALERTS_PER_RUN", "15"))
+REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "1.2"))
+MIN_SCORE = int(os.getenv("MIN_SCORE", "35"))
+
+REQUEST_TIMEOUT = int(os.getenv("REQUEST_TIMEOUT", "20"))
+MAX_SEEN_ITEMS = int(os.getenv("MAX_SEEN_ITEMS", "12000"))
+MAX_RESULTS_PER_QUERY = int(os.getenv("MAX_RESULTS_PER_QUERY", "15"))
+
 TELEGRAM_CHANNELS = [
-    x.strip().lstrip("@")
-    for x in os.getenv("TELEGRAM_CHANNELS", "").split(",")
-    if x.strip()
+    value.strip().lstrip("@")
+    for value in os.getenv("TELEGRAM_CHANNELS", "").split(",")
+    if value.strip()
 ]
 
 EXTRA_RSS = [
-    x.strip()
-    for x in os.getenv("EXTRA_RSS", "").split(",")
-    if x.strip()
+    value.strip()
+    for value in os.getenv("EXTRA_RSS", "").split(",")
+    if value.strip()
 ]
-
-MAX_QUERIES = max(1, int(os.getenv("MAX_QUERIES", "24")))
-REQUEST_DELAY = max(0.0, float(os.getenv("REQUEST_DELAY", "0.4")))
-MAX_ALERTS = max(1, int(os.getenv("MAX_ALERTS_PER_RUN", "25")))
 
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) "
-    "AppleWebKit/537.36 Chrome/128.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/131.0.0.0 Safari/537.36"
 )
 
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+    ],
+)
+
+log = logging.info
+
+
 # ============================================================
-# SEARCH TERMS
+# SEARCH QUERIES
 # ============================================================
 
-BUY_INTENT = [
+SEARCH_QUERIES = [
+    # Русский: прямые запросы покупателей
     '"ищу винтажную одежду"',
-    '"куплю винтажную одежду"',
-    '"где купить винтаж"',
+    '"ищу винтаж"',
+    '"где купить винтажную одежду"',
+    '"где найти винтажную одежду"',
     '"посоветуйте винтажный магазин"',
-    '"ищу винтажку"',
-    '"ищу одежду y2k"',
-    '"куплю одежду y2k"',
-    '"ищу Carhartt"',
-    '"ищу Dickies"',
-    '"ищу Levi\'s"',
-    '"где купить Carhartt"',
     '"ищу винтажную куртку"',
-    '"ищу старые джинсы"',
-    '"ищу оригинальную вещь"',
-    '"кто продаёт винтаж"',
-    '"где достать винтаж"',
-    '"ищу архивную одежду"',
-    '"ищу редкую одежду"',
-    '"куплю винтажные джинсы"',
-    '"ищу одежду 90-х"',
+    '"ищу кожаную винтажную куртку"',
+    '"ищу винтажную джинсовку"',
+    '"ищу винтажные джинсы"',
+    '"ищу винтажные брюки"',
+    '"ищу винтажную юбку"',
+    '"ищу винтажное платье"',
+    '"ищу винтажную рубашку"',
+    '"ищу винтажный свитер"',
+    '"ищу винтажную сумку"',
+    '"ищу одежду second hand"',
+    '"ищу секонд хенд"',
+    '"где купить секонд хенд"',
+    '"ищу одежду из 90-х"',
     '"ищу одежду 2000-х"',
-    '"ищу секонд-хенд"',
-    '"подскажите где купить одежду"',
-    '"ищу такую куртку"',
-    '"ищу такие джинсы"',
+    '"ищу одежду Y2K"',
+    '"куплю винтажную одежду"',
+    '"куплю винтажную куртку"',
+    '"куплю старую кожаную куртку"',
+    '"посоветуйте секонд хенд"',
+    '"где найти одежду Y2K"',
+    '"ищу одежду в стиле гранж"',
+    '"ищу одежду в стиле ретро"',
+
+    # Английский: прямые запросы
+    '"looking for vintage clothes"',
     '"looking for vintage clothing"',
-    '"where to buy vintage clothes"',
+    '"where can I buy vintage clothes"',
+    '"where to find vintage clothing"',
+    '"recommend a vintage store"',
+    '"looking for a vintage jacket"',
+    '"looking for a vintage leather jacket"',
+    '"looking for vintage jeans"',
+    '"looking for vintage denim"',
+    '"looking for a vintage dress"',
+    '"looking for a vintage skirt"',
+    '"looking for a vintage shirt"',
+    '"looking for a vintage bag"',
+    '"looking for second hand clothes"',
+    '"where to buy second hand clothes"',
     '"looking for Y2K clothes"',
-]
+    '"looking for 90s clothing"',
+    '"looking for retro clothing"',
+    '"looking for thrift stores"',
+    '"recommend a thrift store"',
+    '"where can I find thrift stores"',
+    '"looking for vintage streetwear"',
+    '"looking for vintage designer clothing"',
+    '"looking for old school streetwear"',
+    '"looking for a used leather jacket"',
+    '"anyone selling vintage clothes"',
+    '"does anyone know a vintage shop"',
+    '"need recommendations for vintage stores"',
 
-CLOTHING = [
-    "винтажная куртка",
-    "джинсы",
-    "кожаная куртка",
-    "бомбер",
-    "ветровка",
-    "рабочая куртка",
-    "карго",
-    "футболка",
-    "лонгслив",
-    "свитшот",
-    "худи",
-    "спортивная куртка",
-    "флиска",
-    "жилет",
-    "рубашка",
-    "пальто",
-    "кроссовки",
-    "сумка",
-    "джинсовка",
-]
+    # Намерение купить
+    '"want to buy vintage clothes"',
+    '"need a vintage jacket"',
+    '"trying to find vintage clothing"',
+    '"any recommendations for secondhand clothing"',
+    '"looking for affordable vintage clothes"',
+    '"where to shop vintage"',
+    '"looking for vintage Levi\'s"',
+    '"looking for vintage Carhartt"',
+    '"looking for vintage Nike"',
+    '"looking for vintage Adidas"',
+    '"looking for vintage Ralph Lauren"',
+    '"looking for vintage military jacket"',
+    '"looking for vintage workwear"',
 
-STYLES = [
-    "vintage",
-    "винтаж",
-    "Y2K",
-    "ретро",
-    "90s",
-    "80s",
-    "2000s",
-    "streetwear",
-    "grunge",
-    "workwear",
-    "gorpcore",
-    "архивная одежда",
-    "секонд-хенд",
-]
-
-BRANDS = [
-    "Levi's",
-    "Carhartt",
-    "Dickies",
-    "Ralph Lauren",
-    "Tommy Hilfiger",
-    "Diesel",
-    "Nike",
-    "Adidas",
-    "Reebok",
-    "The North Face",
-    "Patagonia",
-    "Stone Island",
-    "Stussy",
-    "Supreme",
-    "Wrangler",
-    "Lee",
-    "Champion",
-    "Umbro",
-    "Lacoste",
-    "Burberry",
-    "Oakley",
-    "Columbia",
-    "Eddie Bauer",
-    "Guess",
-    "Fila",
-    "Polo Sport",
-    "Helly Hansen",
-]
-
-CITIES = [
-    "Москва",
-    "Санкт-Петербург",
-    "Екатеринбург",
-    "Казань",
-    "Новосибирск",
-    "Краснодар",
-    "Сочи",
-    "Ростов-на-Дону",
-    "Самара",
-    "Нижний Новгород",
-    "Челябинск",
-    "Уфа",
-    "Пермь",
-    "Воронеж",
-    "Красноярск",
-    "Омск",
-    "Тюмень",
-]
-
-MARKETPLACES = [
-    "avito.ru",
-    "youla.ru",
-    "meshok.net",
-    "farpost.ru",
-]
-
-SOCIAL_SITES = [
-    "vk.com",
-    "threads.net",
-    "threads.com",
-    "t.me",
-    "reddit.com",
-    "youtube.com",
-    "instagram.com",
-    "facebook.com",
-    "tiktok.com",
-    "pinterest.com",
-    "pikabu.ru",
-]
-
-NEGATIVE_TERMS = [
-    "вакансия",
-    "ищу работу",
-    "работа продавцом",
-    "оптовая продажа",
-    "поставщик",
-    "дропшиппинг",
-    "пошив на заказ",
-    "своё производство",
-    "свое производство",
-]
-
-BUY_WORDS = [
-    "ищу",
-    "куплю",
-    "хочу купить",
-    "где купить",
-    "где найти",
-    "посоветуйте",
-    "подскажите",
-    "кто продаёт",
-    "кто продает",
-    "нужен",
-    "нужна",
-    "нужно",
-    "хочу найти",
-    "looking for",
-    "where to buy",
-    "want to buy",
-    "recommend",
-]
-
-SELLER_WORDS = [
-    "продаю",
-    "продам",
-    "в наличии",
-    "новое поступление",
-    "оптом",
-    "поставщик",
-    "каталог",
+    # Поиск по публичным площадкам
+    'site:threads.com "looking for vintage"',
+    'site:threads.net "looking for vintage"',
+    'site:threads.com "ищу винтаж"',
+    'site:threads.net "ищу винтаж"',
+    'site:reddit.com "looking for vintage clothes"',
+    'site:reddit.com "vintage store recommendations"',
+    'site:reddit.com "looking for a vintage jacket"',
+    'site:reddit.com "where to buy vintage clothing"',
+    'site:avito.ru "ищу винтажную одежду"',
+    'site:avito.ru "куплю винтажную куртку"',
+    'site:youla.ru "ищу винтажную одежду"',
+    'site:youla.ru "куплю винтажную куртку"',
+    'site:youtube.com/shorts "ищу винтаж"',
+    'site:youtube.com/shorts "looking for vintage clothes"',
 ]
 
 
 # ============================================================
-# HELPERS
+# SCORING
 # ============================================================
 
-def log(message):
-    print(
-        f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}] "
-        f"{message}",
-        flush=True,
-    )
+BUYING_PHRASES = [
+    "ищу", "ищем", "нужен", "нужна", "нужно", "нужны",
+    "хочу купить", "куплю", "купить", "где купить",
+    "где найти", "посоветуйте", "порекомендуйте",
+    "кто знает", "кто продает", "кто продаёт", "где взять",
+    "подскажите магазин", "ищу магазин",
+    "looking for", "where can i buy", "where to buy",
+    "where can i find", "need a", "need some",
+    "want to buy", "trying to find", "any recommendations",
+    "recommend a", "does anyone know", "anyone selling",
+    "where to shop", "looking to buy", "can anyone recommend",
+    "i need", "i want",
+]
+
+CLOTHING_TERMS = [
+    "винтаж", "винтажный", "винтажная", "винтажные",
+    "vintage", "second hand", "secondhand", "thrift",
+    "thrifting", "секонд", "секонд-хенд", "секонд хенд",
+    "ретро", "retro", "y2k", "90s", "90's", "2000s",
+    "2000's", "streetwear", "стритвир", "гранж", "grunge",
+    "деним", "denim", "джинсов", "джинсы", "jeans",
+    "джинсовка", "куртк", "jacket", "coat", "пальто",
+    "кожан", "leather", "рубашк", "shirt", "плать",
+    "dress", "юбк", "skirt", "брюк", "trousers", "pants",
+    "свитер", "sweater", "худи", "hoodie", "футболк",
+    "t-shirt", "tshirt", "сумк", "bag", "кардиган",
+    "cardigan", "workwear", "military jacket", "carhartt",
+    "levi's", "levis", "nike", "adidas", "ralph lauren",
+    "tommy hilfiger", "stone island", "diesel",
+    "helmut lang", "archive fashion", "архивная одежда",
+]
+
+SELLING_ONLY_PHRASES = [
+    "продаю", "продам", "продаётся", "продается",
+    "available now", "for sale", "dm to buy", "shop now",
+    "new collection", "link in bio", "подписывайтесь",
+    "подпишись", "мой магазин", "наш магазин",
+]
+
+SPAM_PHRASES = [
+    "заработок без вложений", "криптовалюта", "казино",
+    "ставки на спорт", "розыгрыш айфона", "giveaway",
+    "free crypto", "casino", "betting",
+]
 
 
-def clean_text(value):
-    value = html.unescape(str(value or ""))
-    value = re.sub(r"<[^>]+>", " ", value)
-    return re.sub(r"\s+", " ", value).strip()
+def contains_any(text, phrases):
+    return any(phrase in text for phrase in phrases)
 
 
-def normalize_url(url):
-    url = html.unescape(str(url or "")).strip()
+def score_item(item):
+    """
+    Оценивает содержимое самой публикации.
+    Поисковый запрос не влияет на score, чтобы не создавать
+    ложные совпадения из-за слов 'ищу' в поисковой фразе.
+    """
+    title = str(item.get("title", "") or "")
+    body = str(item.get("text", "") or "")
 
-    if url.startswith("//"):
-        url = "https:" + url
+    text = html.unescape(f"{title} {body}").lower()
+    text = re.sub(r"\s+", " ", text).strip()
+
+    if not text:
+        return 0, ["Пустой текст"]
+
+    score = 0
+    reasons = []
+
+    buying_matches = [
+        phrase for phrase in BUYING_PHRASES
+        if phrase in text
+    ]
+
+    clothing_matches = [
+        phrase for phrase in CLOTHING_TERMS
+        if phrase in text
+    ]
+
+    if buying_matches:
+        score += 35
+        reasons.append("Есть намерение найти или купить")
+
+    if clothing_matches:
+        score += 30
+        reasons.append("Упоминается одежда или винтаж")
+
+    if buying_matches and clothing_matches:
+        score += 20
+        reasons.append("Совпадают намерение и категория")
+
+    specific_items = [
+        "куртк", "jacket", "джинс", "jeans", "пальто",
+        "coat", "плать", "dress", "сумк", "bag",
+        "кожан", "leather", "юбк", "skirt", "рубашк",
+        "shirt", "carhartt", "levi",
+    ]
+
+    if contains_any(text, specific_items):
+        score += 10
+        reasons.append("Указана конкретная вещь или бренд")
+
+    if contains_any(text, SELLING_ONLY_PHRASES) and not buying_matches:
+        score -= 25
+        reasons.append("Похоже на объявление продавца")
+
+    if contains_any(text, SPAM_PHRASES):
+        score -= 50
+        reasons.append("Возможный спам")
+
+    if not buying_matches:
+        score = min(score, 25)
+
+    return max(0, min(score, 100)), reasons
+
+
+# ============================================================
+# FILE STATE
+# ============================================================
+
+def load_json(path, default):
+    try:
+        if path.exists():
+            with path.open("r", encoding="utf-8") as file:
+                return json.load(file)
+    except (OSError, ValueError, TypeError) as exc:
+        log(f"Не удалось прочитать {path}: {exc}")
+
+    return default
+
+
+def save_json(path, data):
+    temporary_path = path.with_suffix(path.suffix + ".tmp")
 
     try:
-        parsed = urllib.parse.urlsplit(url)
+        with temporary_path.open("w", encoding="utf-8") as file:
+            json.dump(data, file, ensure_ascii=False, indent=2)
 
-        if parsed.scheme not in ("http", "https"):
-            return ""
+        temporary_path.replace(path)
 
-        query = [
-            (key, value)
-            for key, value in urllib.parse.parse_qsl(
-                parsed.query,
-                keep_blank_values=True,
-            )
-            if not key.lower().startswith("utm_")
-            and key.lower() not in ("fbclid", "gclid", "yclid")
-        ]
-
-        return urllib.parse.urlunsplit((
-            parsed.scheme,
-            parsed.netloc.lower(),
-            parsed.path.rstrip("/") or "/",
-            urllib.parse.urlencode(query),
-            "",
-        ))
-
-    except Exception:
-        return ""
+    except (OSError, TypeError, ValueError) as exc:
+        log(f"Не удалось сохранить {path}: {exc}")
 
 
-def fetch(url, headers=None, data=None, method="GET", timeout=15):
+seen_data = load_json(SEEN_FILE, {"items": []})
+
+if isinstance(seen_data, list):
+    seen_data = {"items": seen_data}
+
+if not isinstance(seen_data, dict):
+    seen_data = {"items": []}
+
+seen_items = seen_data.get("items", [])
+
+if not isinstance(seen_items, list):
+    seen_items = []
+
+seen_set = set(str(value) for value in seen_items)
+
+state = load_json(STATE_FILE, {"query_cursor": 0})
+
+if not isinstance(state, dict):
+    state = {"query_cursor": 0}
+
+
+def fingerprint(item):
+    url = str(item.get("url", "") or "").strip()
+
+    if url:
+        normalized = url.split("#", 1)[0].strip().rstrip("/")
+    else:
+        normalized = (
+            str(item.get("title", "")) + "|" +
+            str(item.get("text", ""))
+        ).strip().lower()
+
+    return hashlib.sha256(
+        normalized.encode("utf-8", errors="ignore")
+    ).hexdigest()
+
+
+def save_seen():
+    global seen_items, seen_set
+
+    seen_items = seen_items[-MAX_SEEN_ITEMS:]
+    seen_set = set(str(value) for value in seen_items)
+
+    save_json(SEEN_FILE, {"items": seen_items})
+
+
+# ============================================================
+# HTTP
+# ============================================================
+
+def request(url, headers=None, method="GET", data=None):
     request_headers = {
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
@@ -325,392 +400,539 @@ def fetch(url, headers=None, data=None, method="GET", timeout=15):
     if headers:
         request_headers.update(headers)
 
-    request = urllib.request.Request(
+    body = data
+
+    if isinstance(body, dict):
+        body = urllib.parse.urlencode(body).encode("utf-8")
+
+    req = urllib.request.Request(
         url,
-        data=data,
         headers=request_headers,
+        data=body,
         method=method,
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
-            body = response.read(2_000_000)
-            charset = response.headers.get_content_charset() or "utf-8"
-            return response.status, body.decode(charset, errors="replace")
+        with urllib.request.urlopen(
+            req,
+            timeout=REQUEST_TIMEOUT,
+        ) as response:
+            return (
+                response.getcode(),
+                response.read().decode("utf-8", errors="replace"),
+            )
 
-    except urllib.error.HTTPError as error:
-        return error.code, ""
+    except urllib.error.HTTPError as exc:
+        try:
+            error_body = exc.read(5000).decode(
+                "utf-8",
+                errors="replace",
+            )
+        except Exception:
+            error_body = ""
 
-    except Exception as error:
-        log(f"Источник временно недоступен: {urllib.parse.urlsplit(url).netloc}: {error}")
+        log(
+            f"HTTP {exc.code} | {url[:160]} | "
+            f"{error_body[:500].replace(chr(10), ' ')}"
+        )
+
+        return exc.code, error_body
+
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError) as exc:
+        log(f"Ошибка запроса {url[:160]}: {exc}")
         return 0, ""
 
 
-def load_seen():
-    try:
-        result = json.loads(SEEN_FILE.read_text(encoding="utf-8"))
-        return result if isinstance(result, dict) else {}
-    except Exception:
-        return {}
-
-
-def save_seen(seen):
-    if len(seen) > 25000:
-        seen = dict(list(seen.items())[-20000:])
-
-    SEEN_FILE.write_text(
-        json.dumps(seen, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
-
-
-def fingerprint(item):
-    identity = item.get("url") or (
-        item.get("title", "") + item.get("text", "")
-    )
-
-    return hashlib.sha256(
-        identity.encode("utf-8", errors="ignore")
-    ).hexdigest()
-
-
 # ============================================================
-# LEAD SCORING
+# TELEGRAM NOTIFICATIONS
 # ============================================================
 
-def score_lead(item):
-    text = (
-        item.get("title", "")
-        + " "
-        + item.get("text", "")
-        + " "
-        + item.get("query", "")
-    ).lower()
+def telegram_send(message):
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log("Telegram не настроен: проверь TELEGRAM_TOKEN и TELEGRAM_CHAT_ID")
+        return False
 
-    score = 0
-    signals = []
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
 
-    intents = [
-        term for term in BUY_WORDS
-        if term.lower() in text
-    ]
-
-    clothing = [
-        term for term in CLOTHING + STYLES
-        if term.lower() in text
-    ]
-
-    brands = [
-        brand for brand in BRANDS
-        if brand.lower() in text
-    ]
-
-    if intents:
-        score += min(40, 20 + 5 * (len(intents) - 1))
-        signals.append("намерение: " + ", ".join(intents[:3]))
-
-    if clothing:
-        score += min(30, 8 + 4 * len(clothing))
-        signals.append("товар/стиль: " + ", ".join(clothing[:4]))
-
-    if brands:
-        score += min(20, 8 + 4 * len(brands))
-        signals.append("бренд: " + ", ".join(brands[:3]))
-
-    if any(city.lower() in text for city in CITIES):
-        score += 5
-        signals.append("город России")
-
-    if any(term in text for term in NEGATIVE_TERMS):
-        score -= 25
-        signals.append("возможный продавец/оптовик")
-
-    if any(term in text for term in SELLER_WORDS) and not intents:
-        score -= 15
-
-    score = max(0, min(100, score))
-
-    if score >= 60:
-        level = "🔥 ВЫСОКИЙ"
-    elif score >= 35:
-        level = "🟡 СРЕДНИЙ"
-    else:
-        level = "🔎 НИЗКИЙ"
-
-    return score, level, signals
-
-
-def create_item(source, title, url, text="", date="", query=""):
-    url = normalize_url(url)
-
-    if not url:
-        return None
-
-    item = {
-        "source": source,
-        "title": clean_text(title)[:400] or "Без заголовка",
-        "url": url,
-        "text": clean_text(text)[:1500],
-        "date": clean_text(date)[:100],
-        "query": query,
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "text": message[:4000],
+        "disable_web_page_preview": True,
     }
 
-    item["score"], item["level"], item["signals"] = score_lead(item)
-
-    return item
-
-
-# ============================================================
-# SEARCH QUERIES
-# ============================================================
-
-def build_queries():
-    queries = list(BUY_INTENT)
-
-    for brand in BRANDS:
-        queries.append(f'"ищу {brand}"')
-        queries.append(f'"где купить {brand}"')
-        queries.append(f'"куплю {brand} винтаж')
-
-    for clothing in CLOTHING:
-        queries.append(f'"ищу {clothing}" винтаж')
-        queries.append(f'"где купить {clothing}"')
-
-    for style in STYLES:
-        queries.append(f'"ищу" "{style}" одежда')
-        queries.append(f'"где купить" "{style}"')
-
-    for city in CITIES:
-        queries.append(f'"ищу винтажную одежду" "{city}"')
-        queries.append(f'"винтажный магазин" "{city}"')
-
-    # Search public pages indexed from marketplaces and social sites.
-    for domain in MARKETPLACES + SOCIAL_SITES:
-        queries.append(f'site:{domain} "ищу винтажную одежду"')
-        queries.append(f'site:{domain} "где купить винтаж"')
-        queries.append(f'site:{domain} "ищу Carhartt"')
-
-    # Preserve order and remove duplicates.
-    return list(dict.fromkeys(queries))
-
-
-# ============================================================
-# BING RSS SEARCH
-# ============================================================
-
-def bing_search(query):
-    url = (
-        "https://www.bing.com/search?format=rss&count=10&q="
-        + urllib.parse.quote(query)
-    )
-
-    status, body = fetch(
+    status, body = request(
         url,
-        headers={"Accept": "application/rss+xml, application/xml, text/xml"},
+        headers={"Content-Type": "application/json"},
+        method="POST",
+        data=json.dumps(payload).encode("utf-8"),
     )
-
-    if status != 200 or not body:
-        log(f"Bing unavailable: HTTP {status}")
-        return []
 
     try:
-        root = ET.fromstring(body)
-    except Exception:
-        log("Bing returned a non-RSS response.")
-        return []
+        result = json.loads(body)
+    except (ValueError, TypeError):
+        result = {}
 
-    results = []
+    if status == 200 and result.get("ok") is True:
+        return True
 
-    for node in root.findall(".//item")[:10]:
-        title = node.findtext("title", "")
-        link = node.findtext("link", "")
-        description = node.findtext("description", "")
-        pub_date = node.findtext("pubDate", "")
+    log(
+        f"Telegram send failed: HTTP {status}; "
+        f"{str(result.get('description', body))[:500]}"
+    )
 
-        item = create_item(
-            "Bing web search",
-            title,
-            link,
-            description,
-            pub_date,
-            query,
-        )
+    return False
 
-        if item:
-            results.append(item)
 
-    return results
+def build_message(item, score, reasons):
+    title = html.unescape(
+        str(item.get("title", "Без заголовка") or "Без заголовка")
+    )
+
+    body = html.unescape(str(item.get("text", "") or "")).strip()
+    url = str(item.get("url", "") or "").strip()
+    source = str(item.get("source", "Неизвестный источник"))
+    query = str(item.get("query", "") or "")
+
+    title = title[:350]
+    body = body[:1000]
+    query = query[:200]
+
+    lines = [
+        "🧥 VINTAGE CLIENT FINDER",
+        "",
+        f"🎯 Потенциальный клиент: {score}/100",
+        f"🔎 Источник: {source}",
+        "",
+        f"📝 {title}",
+    ]
+
+    if body:
+        lines.extend(["", body])
+
+    if url:
+        lines.extend(["", f"🔗 {url}"])
+
+    if query:
+        lines.extend(["", f"🔍 Поиск: {query}"])
+
+    if reasons:
+        lines.extend(["", "📊 Совпадения: " + "; ".join(reasons)])
+
+    lines.extend([
+        "",
+        "🕒 " + datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC"),
+    ])
+
+    return "\n".join(lines)
 
 
 # ============================================================
-# DUCKDUCKGO SEARCH
+# RESULT HELPERS
 # ============================================================
 
-def duckduckgo_search(query):
-    url = (
-        "https://html.duckduckgo.com/html/?q="
-        + urllib.parse.quote(query)
+def clean_text(value):
+    value = html.unescape(str(value or ""))
+    value = re.sub(
+        r"<script\b[^>]*>.*?</script>",
+        " ",
+        value,
+        flags=re.I | re.S,
     )
+    value = re.sub(
+        r"<style\b[^>]*>.*?</style>",
+        " ",
+        value,
+        flags=re.I | re.S,
+    )
+    value = re.sub(r"<[^>]+>", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
 
-    status, body = fetch(url)
 
-    if status != 200 or not body:
-        log(f"DuckDuckGo unavailable/challenge: HTTP {status}")
-        return []
+def make_item(title, text, url, source, query=""):
+    return {
+        "title": clean_text(title)[:500],
+        "text": clean_text(text)[:5000],
+        "url": str(url or "").strip(),
+        "source": source,
+        "query": str(query or ""),
+    }
 
-    if "anomaly.js" in body.lower():
-        log("DuckDuckGo presented an automated-request challenge.")
-        return []
 
+def normalize_url(url):
+    url = html.unescape(str(url or "")).strip()
+
+    if url.startswith("//"):
+        url = "https:" + url
+
+    return url
+
+
+# ============================================================
+# RSS PARSER
+# ============================================================
+
+def parse_rss(xml_text, source, query=""):
     results = []
 
-    # Extract individual result links conservatively.
-    pattern = re.compile(
-        r'<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>',
-        re.IGNORECASE | re.DOTALL,
-    )
+    try:
+        root = ET.fromstring(xml_text)
+    except (ET.ParseError, ValueError) as exc:
+        log(f"Ошибка RSS XML ({source}): {exc}")
+        return results
 
-    for match in pattern.finditer(body):
-        url_found = html.unescape(match.group(1))
-        title = clean_text(match.group(2))
+    for node in root.iter():
+        tag_name = node.tag.split("}")[-1].lower()
 
-        try:
-            parsed = urllib.parse.urlsplit(url_found)
-            params = urllib.parse.parse_qs(parsed.query)
+        if tag_name not in ("item", "entry"):
+            continue
 
-            if "uddg" in params:
-                url_found = params["uddg"][0]
-        except Exception:
-            pass
+        fields = {}
 
-        item = create_item(
-            "DuckDuckGo web search",
-            title,
-            url_found,
-            "",
-            "",
-            query,
+        for child in list(node):
+            child_tag = child.tag.split("}")[-1].lower()
+            child_value = "".join(child.itertext()).strip()
+
+            if child_tag not in fields:
+                fields[child_tag] = child_value
+
+        title = fields.get("title", "")
+        description = (
+            fields.get("description", "")
+            or fields.get("summary", "")
+            or fields.get("content", "")
         )
 
-        if item:
-            results.append(item)
+        link = fields.get("link", "")
 
-        if len(results) >= 10:
+        if not link:
+            for child in list(node):
+                if child.tag.split("}")[-1].lower() == "link":
+                    link = child.attrib.get("href", "")
+                    if link:
+                        break
+
+        if title or description:
+            results.append(
+                make_item(
+                    title=title,
+                    text=description,
+                    url=normalize_url(link),
+                    source=source,
+                    query=query,
+                )
+            )
+
+        if len(results) >= MAX_RESULTS_PER_QUERY:
             break
 
     return results
 
 
 # ============================================================
-# OPTIONAL YOUTUBE API
+# DUCKDUCKGO HTML SEARCH
+# ============================================================
+
+class DuckDuckGoParser(HTMLParser):
+    """
+    Извлекает заголовок, ссылку и сниппет результата.
+    Сниппет привязывается к результату после обработки заголовка.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.results = []
+        self.current = None
+        self.capture_title = False
+        self.title_depth = 0
+        self.capture_snippet = False
+        self.snippet_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "").split()
+        href = attrs.get("href", "")
+
+        if tag == "a" and "result__a" in classes:
+            self._finish_result()
+
+            self.current = {
+                "title": "",
+                "url": href,
+                "text": "",
+            }
+
+            self.capture_title = True
+            self.title_depth = 1
+            return
+
+        if self.current and tag == "div" and "result__snippet" in classes:
+            self.capture_snippet = True
+            self.snippet_depth = 1
+            return
+
+        if self.capture_title and tag in ("span", "b", "strong"):
+            self.title_depth += 1
+
+        if self.capture_snippet and tag in ("div", "span", "b", "strong"):
+            self.snippet_depth += 1
+
+    def handle_endtag(self, tag):
+        if self.capture_title and tag == "a":
+            self.capture_title = False
+            self.title_depth = 0
+
+        if self.capture_snippet and tag in ("div", "span", "b", "strong"):
+            self.snippet_depth -= 1
+
+            if self.snippet_depth <= 0:
+                self.capture_snippet = False
+                self.snippet_depth = 0
+
+    def handle_data(self, data):
+        if not self.current:
+            return
+
+        if self.capture_title:
+            self.current["title"] += data
+
+        elif self.capture_snippet:
+            self.current["text"] += " " + data
+
+    def _finish_result(self):
+        if self.current:
+            title = clean_text(self.current.get("title", ""))
+            url = self.current.get("url", "")
+            text = clean_text(self.current.get("text", ""))
+
+            if title and url:
+                self.results.append({
+                    "title": title,
+                    "url": url,
+                    "text": text,
+                })
+
+        self.current = None
+        self.capture_title = False
+        self.capture_snippet = False
+        self.title_depth = 0
+        self.snippet_depth = 0
+
+    def close(self):
+        super().close()
+        self._finish_result()
+
+
+def duckduckgo_search(query):
+    url = (
+        "https://html.duckduckgo.com/html/?"
+        + urllib.parse.urlencode({"q": query})
+    )
+
+    status, content = request(
+        url,
+        headers={
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+            "Referer": "https://duckduckgo.com/",
+        },
+    )
+
+    if status != 200 or not content:
+        log(f"DuckDuckGo unavailable: HTTP {status}")
+        return []
+
+    if "anomaly-modal" in content.lower():
+        log("DuckDuckGo показал проверку; запрос пропущен")
+        return []
+
+    parser = DuckDuckGoParser()
+
+    try:
+        parser.feed(content)
+        parser.close()
+    except Exception as exc:
+        log(f"DuckDuckGo parser error: {exc}")
+        return []
+
+    results = []
+
+    for entry in parser.results[:MAX_RESULTS_PER_QUERY]:
+        result_url = entry.get("url", "")
+
+        if "duckduckgo.com/l/?" in result_url:
+            parsed = urllib.parse.urlparse(result_url)
+            params = urllib.parse.parse_qs(parsed.query)
+            result_url = params.get("uddg", [result_url])[0]
+
+        result_url = normalize_url(result_url)
+
+        if not result_url.startswith(("http://", "https://")):
+            continue
+
+        results.append(
+            make_item(
+                title=entry["title"],
+                text=entry["text"],
+                url=result_url,
+                source="DuckDuckGo Web Search",
+                query=query,
+            )
+        )
+
+    log(f"DuckDuckGo: {len(results)} результатов")
+    return results
+
+
+# ============================================================
+# BING RSS SEARCH
+# ============================================================
+
+bing_disabled = False
+
+
+def bing_search(query):
+    global bing_disabled
+
+    if bing_disabled:
+        return []
+
+    url = (
+        "https://www.bing.com/search?"
+        + urllib.parse.urlencode({
+            "q": query,
+            "format": "rss",
+            "count": MAX_RESULTS_PER_QUERY,
+        })
+    )
+
+    status, content = request(
+        url,
+        headers={
+            "Accept": "application/rss+xml,application/xml,text/xml,*/*",
+        },
+    )
+
+    if status in (202, 403, 429):
+        log(f"Bing RSS отключён на этот запуск: HTTP {status}")
+        bing_disabled = True
+        return []
+
+    if status != 200 or not content:
+        return []
+
+    results = parse_rss(content, "Bing RSS", query)
+    log(f"Bing RSS: {len(results)} результатов")
+    return results
+
+
+# ============================================================
+# YOUTUBE DATA API
 # ============================================================
 
 def youtube_search(query):
     if not YOUTUBE_API_KEY:
         return []
 
-    params = urllib.parse.urlencode({
-        "part": "snippet",
-        "type": "video",
-        "maxResults": 10,
-        "q": query,
-        "key": YOUTUBE_API_KEY,
-        "regionCode": "RU",
-        "relevanceLanguage": "ru",
-        "order": "date",
-    })
+    url = (
+        "https://www.googleapis.com/youtube/v3/search?"
+        + urllib.parse.urlencode({
+            "part": "snippet",
+            "type": "video",
+            "maxResults": min(MAX_RESULTS_PER_QUERY, 50),
+            "q": query,
+            "key": YOUTUBE_API_KEY,
+        })
+    )
 
-    url = "https://www.googleapis.com/youtube/v3/search?" + params
-
-    status, body = fetch(url)
+    status, content = request(url)
 
     if status != 200:
-        log(f"YouTube API unavailable: HTTP {status}")
+        log(f"YouTube API: HTTP {status}")
         return []
 
     try:
-        data = json.loads(body)
-    except Exception:
+        data = json.loads(content)
+    except (ValueError, TypeError):
+        return []
+
+    if "error" in data:
+        log(f"YouTube API error: {str(data['error'])[:400]}")
         return []
 
     results = []
 
-    for row in data.get("items", []):
-        snippet = row.get("snippet", {})
-        video_id = row.get("id", {}).get("videoId")
+    for entry in data.get("items", []):
+        snippet = entry.get("snippet", {})
+        video_id = entry.get("id", {}).get("videoId", "")
 
         if not video_id:
             continue
 
-        item = create_item(
-            "YouTube API",
-            snippet.get("title", ""),
-            f"https://www.youtube.com/watch?v={video_id}",
-            snippet.get("description", ""),
-            snippet.get("publishedAt", ""),
-            query,
+        results.append(
+            make_item(
+                title=snippet.get("title", ""),
+                text=snippet.get("description", ""),
+                url=f"https://www.youtube.com/watch?v={video_id}",
+                source="YouTube Data API",
+                query=query,
+            )
         )
-
-        if item:
-            results.append(item)
 
     return results
 
 
 # ============================================================
-# OPTIONAL VK API
+# VK API
 # ============================================================
 
 def vk_search(query):
     if not VK_TOKEN:
         return []
 
-    params = urllib.parse.urlencode({
-        "q": query,
-        "count": 20,
-        "access_token": VK_TOKEN,
-        "v": "5.199",
-    })
+    url = (
+        "https://api.vk.com/method/newsfeed.search?"
+        + urllib.parse.urlencode({
+            "q": query,
+            "count": min(MAX_RESULTS_PER_QUERY, 200),
+            "access_token": VK_TOKEN,
+            "v": "5.199",
+        })
+    )
 
-    url = "https://api.vk.com/method/newsfeed.search?" + params
-
-    status, body = fetch(url)
+    status, content = request(url)
 
     if status != 200:
-        log(f"VK API unavailable: HTTP {status}")
+        log(f"VK API: HTTP {status}")
         return []
 
     try:
-        data = json.loads(body)
-    except Exception:
+        data = json.loads(content)
+    except (ValueError, TypeError):
         return []
 
-    if "error" in data:
-        log("VK API error: " + str(data["error"].get("error_msg", "unknown")))
+    if data.get("error"):
+        log("VK API error: " + str(data["error"].get("error_msg", ""))[:300])
         return []
 
     results = []
 
-    for row in data.get("response", {}).get("items", []):
-        owner = row.get("owner_id")
-        post_id = row.get("id")
+    for entry in data.get("response", {}).get("items", []):
+        owner_id = entry.get("owner_id")
+        post_id = entry.get("id")
 
-        if owner is None or post_id is None:
+        if not owner_id or not post_id:
             continue
 
-        text = row.get("text", "")
+        text = entry.get("text", "")
 
-        item = create_item(
-            "VK API",
-            text[:120] or "VK post",
-            f"https://vk.com/wall{owner}_{post_id}",
-            text,
-            "",
-            query,
+        results.append(
+            make_item(
+                title=text[:200] or "VK post",
+                text=text,
+                url=f"https://vk.com/wall{owner_id}_{post_id}",
+                source="VK API",
+                query=query,
+            )
         )
-
-        if item:
-            results.append(item)
 
     return results
 
@@ -720,331 +942,476 @@ def vk_search(query):
 # ============================================================
 
 def reddit_search(query):
-    url = "https://www.reddit.com/search.json?" + urllib.parse.urlencode({
-        "q": query,
-        "sort": "new",
-        "limit": 10,
-        "type": "link",
-    })
+    url = (
+        "https://www.reddit.com/search.json?"
+        + urllib.parse.urlencode({
+            "q": query,
+            "sort": "new",
+            "limit": min(MAX_RESULTS_PER_QUERY, 100),
+            "type": "link",
+        })
+    )
 
-    status, body = fetch(
+    status, content = request(
         url,
-        headers={"User-Agent": "VintageClientFinder/1.0 public search"},
+        headers={
+            "User-Agent": "VintageClientFinder/1.0",
+            "Accept": "application/json",
+        },
     )
 
     if status != 200:
-        log(f"Reddit search unavailable: HTTP {status}")
+        log(f"Reddit search: HTTP {status}")
         return []
 
     try:
-        data = json.loads(body)
-    except Exception:
+        data = json.loads(content)
+    except (ValueError, TypeError):
         return []
 
     results = []
 
     for child in data.get("data", {}).get("children", []):
-        post = child.get("data", {})
+        entry = child.get("data", {})
+        permalink = entry.get("permalink", "")
 
-        item = create_item(
-            "Reddit public search",
-            post.get("title", ""),
-            "https://www.reddit.com" + post.get("permalink", ""),
-            post.get("selftext", ""),
-            "",
-            query,
+        if not permalink:
+            continue
+
+        results.append(
+            make_item(
+                title=entry.get("title", ""),
+                text=entry.get("selftext", ""),
+                url="https://www.reddit.com" + permalink,
+                source="Reddit Public Search",
+                query=query,
+            )
         )
-
-        if item:
-            results.append(item)
 
     return results
 
 
 # ============================================================
-# PUBLIC TELEGRAM CHANNEL PREVIEWS
+# FIXED TELEGRAM PUBLIC CHANNEL PARSER
 # ============================================================
+
+class TelegramPreviewParser(HTMLParser):
+    """
+    Парсер публичного HTML-превью t.me/s/<channel>.
+
+    Ключевое исправление:
+    - корректно отслеживается вложенность контейнеров div;
+    - текст сообщения собирается только внутри блока текста;
+    - permalink берётся из tgme_widget_message_date;
+    - сообщение завершается на закрытии внешнего контейнера;
+    - сообщения без индивидуальных ссылок не выдаются как отдельные лиды.
+    """
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+
+        self.messages = []
+        self.current = None
+
+        self.message_depth = 0
+        self.capture_text = False
+        self.text_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        classes = attrs.get("class", "").split()
+
+        # Начало внешнего контейнера одного Telegram-сообщения.
+        if tag == "div" and "tgme_widget_message" in classes:
+            if self.current is not None:
+                self._finish_message()
+
+            self.current = {
+                "text": "",
+                "url": "",
+            }
+
+            self.message_depth = 1
+            self.capture_text = False
+            self.text_depth = 0
+            return
+
+        if self.current is None:
+            return
+
+        # Учитываем вложенность div всего сообщения.
+        if tag == "div":
+            self.message_depth += 1
+
+        # Telegram указывает индивидуальный permalink на дате сообщения.
+        if tag == "a" and "tgme_widget_message_date" in classes:
+            href = attrs.get("href", "").strip()
+
+            if href:
+                self.current["url"] = href
+
+        # Контейнер текста сообщения.
+        if tag == "div" and "tgme_widget_message_text" in classes:
+            self.capture_text = True
+            self.text_depth = 1
+            return
+
+        # Вложенные div внутри блока текста.
+        if self.capture_text and tag == "div":
+            self.text_depth += 1
+
+    def handle_endtag(self, tag):
+        if self.current is None or tag != "div":
+            return
+
+        # Уменьшаем глубину блока текста.
+        if self.capture_text:
+            self.text_depth -= 1
+
+            if self.text_depth <= 0:
+                self.capture_text = False
+                self.text_depth = 0
+
+        # Уменьшаем глубину контейнера сообщения.
+        self.message_depth -= 1
+
+        # Только закрытие внешнего контейнера завершает сообщение.
+        if self.message_depth <= 0:
+            self._finish_message()
+
+    def handle_data(self, data):
+        if self.current is not None and self.capture_text:
+            self.current["text"] += " " + data
+
+    def handle_startendtag(self, tag, attrs):
+        self.handle_starttag(tag, attrs)
+
+        # Для самозакрывающегося элемента не закрываем внешнее сообщение.
+        if tag.lower() == "div":
+            self.handle_endtag(tag)
+
+    def _finish_message(self):
+        if self.current is None:
+            return
+
+        text = clean_text(self.current.get("text", ""))
+        url = self.current.get("url", "").strip()
+
+        if text and url:
+            if url.startswith("/"):
+                url = "https://t.me" + url
+
+            self.messages.append({
+                "title": text[:200],
+                "text": text,
+                "url": url,
+            })
+
+        self.current = None
+        self.message_depth = 0
+        self.capture_text = False
+        self.text_depth = 0
+
+    def close(self):
+        super().close()
+        self._finish_message()
+
 
 def telegram_channel_search(channel):
-    # This reads public channel previews, not Telegram's global search.
-    url = "https://t.me/s/" + urllib.parse.quote(channel)
-    status, body = fetch(url)
+    channel = channel.strip().lstrip("@")
 
-    if status != 200 or not body:
-        log(f"Public Telegram channel unavailable: @{channel}")
+    if not re.fullmatch(r"[A-Za-z0-9_]{4,}", channel):
+        log(f"Некорректное имя Telegram-канала: {channel}")
         return []
 
-    results = []
+    url = f"https://t.me/s/{urllib.parse.quote(channel)}"
 
-    # Parse post identifiers and nearby message text.
-    post_ids = re.findall(
-        r'data-post="([^"]+)"',
-        body,
-    )
-
-    for post_id in dict.fromkeys(post_ids):
-        post_url = "https://t.me/" + post_id
-        escaped_id = re.escape(post_id)
-
-        match = re.search(
-            escaped_id + r'[\s\S]{0,5000}?tgme_widget_message_text[^>]*>([\s\S]*?)</div>',
-            body,
-        )
-
-        text = clean_text(match.group(1)) if match else ""
-
-        item = create_item(
-            f"Telegram public channel @{channel}",
-            text[:120] or "Public Telegram post",
-            post_url,
-            text,
-            "",
-            "@" + channel,
-        )
-
-        if item:
-            results.append(item)
-
-    return results
-
-
-# ============================================================
-# EXTRA RSS FEEDS
-# ============================================================
-
-def rss_search(feed_url):
-    status, body = fetch(
-        feed_url,
-        headers={"Accept": "application/rss+xml, application/atom+xml, application/xml"},
-    )
-
-    if status != 200 or not body:
-        log(f"RSS unavailable: HTTP {status} — {feed_url}")
-        return []
-
-    try:
-        root = ET.fromstring(body)
-    except Exception:
-        log(f"Invalid RSS/XML: {feed_url}")
-        return []
-
-    results = []
-
-    # RSS 2.0
-    for node in root.findall(".//item")[:100]:
-        item = create_item(
-            "Custom RSS",
-            node.findtext("title", ""),
-            node.findtext("link", ""),
-            node.findtext("description", ""),
-            node.findtext("pubDate", ""),
-            feed_url,
-        )
-
-        if item:
-            results.append(item)
-
-    # Atom
-    ns = {"atom": "http://www.w3.org/2005/Atom"}
-
-    for node in root.findall(".//atom:entry", ns)[:100]:
-        link_node = node.find("atom:link", ns)
-        link = link_node.attrib.get("href", "") if link_node is not None else ""
-
-        item = create_item(
-            "Custom RSS / Atom",
-            node.findtext("atom:title", "", ns),
-            link,
-            node.findtext("atom:summary", "", ns),
-            node.findtext("atom:published", "", ns),
-            feed_url,
-        )
-
-        if item:
-            results.append(item)
-
-    return results
-
-
-# ============================================================
-# TELEGRAM NOTIFICATIONS
-# ============================================================
-
-def send_telegram(item):
-    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-        log("Telegram credentials missing; alert printed to logs.")
-        print(format_message(item))
-        return False
-
-    message = format_message(item)
-
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-
-    payload = urllib.parse.urlencode({
-        "chat_id": TELEGRAM_CHAT_ID,
-        "text": message,
-        "disable_web_page_preview": "true",
-    }).encode("utf-8")
-
-    status, body = fetch(
+    status, content = request(
         url,
-        headers={"Content-Type": "application/x-www-form-urlencoded"},
-        data=payload,
-        method="POST",
-        timeout=20,
+        headers={
+            "Accept-Language": "en-US,en;q=0.9,ru;q=0.8",
+        },
     )
 
-    if status != 200:
-        log(f"Telegram send failed: HTTP {status}")
-        return False
+    if status != 200 or not content:
+        log(f"Telegram preview @{channel}: HTTP {status}")
+        return []
+
+    parser = TelegramPreviewParser()
 
     try:
-        return bool(json.loads(body).get("ok"))
-    except Exception:
-        return False
+        parser.feed(content)
+        parser.close()
+    except Exception as exc:
+        log(f"Ошибка парсинга Telegram @{channel}: {exc}")
+        return []
 
+    results = []
+    seen_urls = set()
 
-def format_message(item):
-    signals = "; ".join(item.get("signals", [])) or "Недостаточно сигналов"
+    for entry in parser.messages:
+        message_url = entry.get("url", "").strip()
 
-    return (
-        "🧥 VINTAGE CLIENT FINDER\n\n"
-        f"Потенциал: {item['level']}\n"
-        f"Балл: {item['score']}/100\n"
-        f"Источник: {item['source']}\n"
-        f"Заголовок: {item['title']}\n\n"
-        f"Текст: {item.get('text', '')[:900] or 'Описание не найдено'}\n\n"
-        f"Сигналы: {signals}\n"
-        f"Дата: {item.get('date', '') or 'не указана'}\n"
-        f"Запрос: {item.get('query', '')}\n\n"
-        f"Ссылка: {item['url']}"
+        if message_url.startswith("/"):
+            message_url = "https://t.me" + message_url
+
+        if not message_url.startswith("https://t.me/"):
+            continue
+
+        if message_url in seen_urls:
+            continue
+
+        seen_urls.add(message_url)
+
+        results.append(
+            make_item(
+                title=entry["title"],
+                text=entry["text"],
+                url=message_url,
+                source=f"Telegram Public Channel @{channel}",
+            )
+        )
+
+    log(
+        f"Telegram @{channel}: "
+        f"{len(results)} сообщений с уникальными ссылками"
     )
+
+    return results
+
+
+# ============================================================
+# EXTRA RSS
+# ============================================================
+
+def extra_rss_search():
+    results = []
+
+    for feed_url in EXTRA_RSS:
+        status, content = request(
+            feed_url,
+            headers={
+                "Accept": (
+                    "application/rss+xml,application/atom+xml,"
+                    "application/xml,*/*"
+                ),
+            },
+        )
+
+        if status != 200 or not content:
+            log(f"Дополнительный RSS недоступен: HTTP {status}")
+            continue
+
+        results.extend(
+            parse_rss(content, source="Extra RSS")
+        )
+
+        time.sleep(REQUEST_DELAY)
+
+    log(f"Дополнительные RSS: {len(results)} результатов")
+    return results
+
+
+# ============================================================
+# SEARCH RUNNER
+# ============================================================
+
+def collect_search_results(query):
+    results = []
+
+    # Поисковые системы.
+    results.extend(duckduckgo_search(query))
+    time.sleep(REQUEST_DELAY)
+
+    results.extend(bing_search(query))
+    time.sleep(REQUEST_DELAY)
+
+    # Источники, требующие ключей.
+    if YOUTUBE_API_KEY:
+        results.extend(youtube_search(query))
+        time.sleep(REQUEST_DELAY)
+
+    if VK_TOKEN:
+        results.extend(vk_search(query))
+        time.sleep(REQUEST_DELAY)
+
+    # Публичный поиск Reddit.
+    results.extend(reddit_search(query))
+    time.sleep(REQUEST_DELAY)
+
+    return results
 
 
 # ============================================================
 # MAIN
 # ============================================================
 
-def main():
-    log("=== VINTAGE CLIENT FINDER START ===")
+def run_once():
+    if not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
+        log(
+            "ОШИБКА: добавь TELEGRAM_TOKEN и TELEGRAM_CHAT_ID "
+            "в GitHub Secrets."
+        )
+        return
 
-    seen = load_seen()
-    queries = build_queries()
+    if not SEARCH_QUERIES:
+        log("Нет поисковых запросов.")
+        return
 
-    # Rotate query batches between scheduled runs so that the whole query bank
-    # is searched over time rather than repeating only the first terms.
-    state_path = BASE_DIR / "search_state.json"
+    log("=" * 60)
+    log("VINTAGE CLIENT FINDER started")
+    log(f"Queries available: {len(SEARCH_QUERIES)}")
+    log(f"Minimum score: {MIN_SCORE}")
+    log(f"Alert limit: {MAX_ALERTS_PER_RUN}")
+    log(f"Seen items: {len(seen_set)}")
+    log(f"VK enabled: {bool(VK_TOKEN)}")
+    log(f"YouTube enabled: {bool(YOUTUBE_API_KEY)}")
+    log(f"Telegram channels: {len(TELEGRAM_CHANNELS)}")
+    log(f"Extra RSS feeds: {len(EXTRA_RSS)}")
 
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-    except Exception:
-        state = {}
+    cursor = int(state.get("query_cursor", 0) or 0)
+    cursor %= len(SEARCH_QUERIES)
 
-    cursor = int(state.get("cursor", 0)) % len(queries)
+    query_count = min(MAX_QUERIES, len(SEARCH_QUERIES))
 
-    batch = [
-        queries[(cursor + i) % len(queries)]
-        for i in range(min(MAX_QUERIES, len(queries)))
+    queries = [
+        SEARCH_QUERIES[(cursor + offset) % len(SEARCH_QUERIES)]
+        for offset in range(query_count)
     ]
 
-    state["cursor"] = (cursor + len(batch)) % len(queries)
+    next_cursor = (cursor + query_count) % len(SEARCH_QUERIES)
 
-    state_path.write_text(
-        json.dumps(state, ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    collected = []
 
-    log(f"Query bank: {len(queries)}")
-    log(f"Queries this run: {len(batch)}")
+    for index, query in enumerate(queries, start=1):
+        log(f"Query {index}/{len(queries)}: {query}")
 
-    results = []
+        try:
+            collected.extend(collect_search_results(query))
+        except Exception as exc:
+            log(f"Ошибка поиска по запросу {query}: {exc}")
 
-    for index, query in enumerate(batch, start=1):
-        log(f"Searching {index}/{len(batch)}: {query}")
+        time.sleep(REQUEST_DELAY)
 
-        results.extend(bing_search(query))
-        results.extend(duckduckgo_search(query))
-
-        # Optional API integrations use a subset to control API quotas.
-        if index <= 8:
-            results.extend(youtube_search(query))
-            results.extend(vk_search(query))
-
-        if index <= 5:
-            results.extend(reddit_search(query))
-
-        if REQUEST_DELAY:
-            time.sleep(REQUEST_DELAY)
-
-    for feed in EXTRA_RSS:
-        results.extend(rss_search(feed))
-
+    # Проверяем последние публикации заданных публичных Telegram-каналов.
     for channel in TELEGRAM_CHANNELS:
-        results.extend(telegram_channel_search(channel))
+        try:
+            collected.extend(telegram_channel_search(channel))
+        except Exception as exc:
+            log(f"Ошибка Telegram-канала @{channel}: {exc}")
 
-    # Prefer the strongest result when the same URL is found by several sources.
-    unique = {}
+        time.sleep(REQUEST_DELAY)
 
-    for item in results:
-        key = fingerprint(item)
+    # Дополнительные RSS-источники.
+    try:
+        collected.extend(extra_rss_search())
+    except Exception as exc:
+        log(f"Ошибка дополнительных RSS: {exc}")
 
-        if key not in unique or item["score"] > unique[key]["score"]:
-            unique[key] = item
+    log(f"Всего собрано результатов: {len(collected)}")
 
-    ranked = sorted(
-        unique.items(),
-        key=lambda pair: pair[1]["score"],
+    # Дедупликация в рамках одного запуска.
+    unique_results = []
+    batch_fingerprints = set()
+
+    for item in collected:
+        fp = fingerprint(item)
+
+        if fp in batch_fingerprints:
+            continue
+
+        batch_fingerprints.add(fp)
+        unique_results.append(item)
+
+    log(f"После дедупликации: {len(unique_results)}")
+
+    # Отбираем кандидатов по содержимому публикации.
+    candidates = []
+
+    for item in unique_results:
+        fp = fingerprint(item)
+
+        if fp in seen_set:
+            continue
+
+        score, reasons = score_item(item)
+
+        if score < MIN_SCORE:
+            continue
+
+        candidates.append({
+            "item": item,
+            "fingerprint": fp,
+            "score": score,
+            "reasons": reasons,
+        })
+
+    candidates.sort(
+        key=lambda candidate: candidate["score"],
         reverse=True,
     )
 
-    log(f"Raw results: {len(results)}")
-    log(f"Unique results: {len(unique)}")
+    log(f"Кандидатов выше порога: {len(candidates)}")
 
-    sent = 0
+    sent_count = 0
 
-    for key, item in ranked:
-        if key in seen:
-            continue
-
-        # Skip very weak matches to avoid flooding the Telegram chat.
-        if item["score"] < 20:
-            seen[key] = {
-                "url": item["url"],
-                "score": item["score"],
-                "seen_at": datetime.now(timezone.utc).isoformat(),
-            }
-            continue
-
-        log(
-            f"LEAD score={item['score']} "
-            f"source={item['source']} "
-            f"title={item['title'][:100]} "
-            f"url={item['url']}"
-        )
-
-        delivered = send_telegram(item)
-
-        # In console-only mode, record results so logs do not repeat forever.
-        if delivered or not TELEGRAM_TOKEN or not TELEGRAM_CHAT_ID:
-            seen[key] = {
-                "url": item["url"],
-                "score": item["score"],
-                "source": item["source"],
-                "seen_at": datetime.now(timezone.utc).isoformat(),
-            }
-            sent += 1
-
-        if sent >= MAX_ALERTS:
-            log("Reached MAX_ALERTS_PER_RUN limit.")
+    for candidate in candidates:
+        if sent_count >= MAX_ALERTS_PER_RUN:
+            log("Достигнут лимит уведомлений за запуск.")
             break
 
-        time.sleep(0.2)
+        message = build_message(
+            candidate["item"],
+            candidate["score"],
+            candidate["reasons"],
+        )
 
-    save_seen(seen)
+        if telegram_send(message):
+            seen_items.append(candidate["fingerprint"])
+            seen_set.add(candidate["fingerprint"])
+            sent_count += 1
 
-    log(f"New leads processed: {sent}")
-    log(f"Stored fingerprints: {len(seen)}")
-    log("=== RUN FINISHED ===")
+            log(
+                f"Уведомление отправлено: "
+                f"score={candidate['score']}; "
+                f"source={candidate['item'].get('source', '')}"
+            )
+
+            save_seen()
+            time.sleep(0.8)
+
+        else:
+            log(
+                "Отправка не удалась; публикация не помечена "
+                "как обработанная."
+            )
+
+    # Сохраняем курсор после завершения поискового прохода.
+    state["query_cursor"] = next_cursor
+    state["last_run_utc"] = datetime.now(timezone.utc).isoformat()
+    state["last_results_count"] = len(collected)
+    state["last_unique_count"] = len(unique_results)
+    state["last_candidates_count"] = len(candidates)
+    state["last_alerts_sent"] = sent_count
+
+    save_json(STATE_FILE, state)
+    save_seen()
+
+    log(
+        f"Завершено. Отправлено: {sent_count}; "
+        f"следующий курсор: {next_cursor}"
+    )
+    log("=" * 60)
+
+
+def main():
+    try:
+        run_once()
+    except KeyboardInterrupt:
+        log("Остановка по запросу пользователя.")
+    except Exception as exc:
+        log(f"Критическая ошибка запуска: {exc}")
+        raise
 
 
 if __name__ == "__main__":
