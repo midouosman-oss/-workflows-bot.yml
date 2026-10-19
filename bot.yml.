@@ -1,148 +1,48 @@
-name: Vintage Monitor
-
+name: Lead Radar
 on:
   workflow_dispatch:
   schedule:
     - cron: "17 */6 * * *"
-
 permissions:
   contents: write
-
 concurrency:
-  group: vintage-monitor-main
+  group: lead-radar
   cancel-in-progress: false
-
 jobs:
-  run:
+  monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
-
+    timeout-minutes: 10
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
-        with:
-          ref: main
-          fetch-depth: 0
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-          cache-dependency-path: requirements.txt
-
+          cache: "pip"
       - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          if [ -f requirements.txt ]; then
-            pip install -r requirements.txt
-          fi
-
-      - name: Run Vintage Monitor
+        run: pip install -r requirements.txt
+      - name: Run Lead Radar
         env:
           TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
-          TG_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          TG_CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
-
-          VK_TOKEN: ${{ secrets.VK_TOKEN }}
           YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
-
-          PYTHONUNBUFFERED: "1"
+          MIN_SCORE: "55"
+          MAX_ALERTS_PER_RUN: "10"
+        run: python bot.py
+      - name: Save deduplication state
         run: |
-          if [ ! -f bot.py ]; then
-            echo "ERROR: bot.py not found"
-            exit 1
+          if [ -n "$(git status --porcelain leads_state.json)" ]; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git add leads_state.json
+            git commit -m "Update Lead Radar state [skip ci]"
+            git push
           fi
-
-          python -u bot.py
-
-      - name: Save seen state safely
-        if: success()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -eu
-
-          git config user.name "threads-bot"
-          git config user.email "threads-bot@users.noreply.github.com"
-
-          if [ ! -f seen.json ]; then
-            echo "seen.json not found; nothing to save"
-            exit 0
-          fi
-
-          # Сохраняем результат работы бота до обновления main.
-          cp seen.json /tmp/seen-local.json
-
-          for attempt in 1 2 3 4 5; do
-            echo "Save attempt: $attempt/5"
-
-            git fetch origin main
-            git reset --hard origin/main
-
-            # Объединяем локальное состояние с актуальным seen.json.
-            python - <<'PY'
-          import json
-          import os
-
-          local_path = "/tmp/seen-local.json"
-          remote_path = "seen.json"
-
-          def load_json(path):
-              if not os.path.exists(path):
-                  return {}
-              with open(path, "r", encoding="utf-8") as f:
-                  return json.load(f)
-
-          def merge_values(remote, local):
-              if isinstance(remote, dict) and isinstance(local, dict):
-                  result = dict(remote)
-                  for key, value in local.items():
-                      if key in result:
-                          result[key] = merge_values(result[key], value)
-                      else:
-                          result[key] = value
-                  return result
-
-              if isinstance(remote, list) and isinstance(local, list):
-                  result = list(remote)
-                  for value in local:
-                      if value not in result:
-                          result.append(value)
-                  return result
-
-              # Для одинаковых ключей приоритет у нового локального значения.
-              return local
-
-          local_data = load_json(local_path)
-          remote_data = load_json(remote_path)
-          merged = merge_values(remote_data, local_data)
-
-          with open(remote_path, "w", encoding="utf-8") as f:
-              json.dump(merged, f, ensure_ascii=False, indent=2)
-              f.write("\n")
-
-          print("seen.json merged successfully")
-          PY
-
-            git add seen.json
-
-            if git diff --cached --quiet; then
-              echo "No changes to save"
-              exit 0
-            fi
-
-            git commit -m "update seen state"
-
-            if git push origin HEAD:main; then
-              echo "seen.json saved successfully"
-              exit 0
-            fi
-
-            echo "Push failed; retrying..."
-            sleep "$attempt"
-          done
-
-          echo "ERROR: Failed to save seen.json after 5 attempts"
-          exit 1
+**После вставки:**
+1. Нажми **Commit changes**.
+2. Открой **Settings → Actions → General**.
+3. В разделе *Workflow permissions* включи **Read and write permissions** и сохрани настройки.
+4. Открой **Actions → Lead Radar → Run workflow** и запусти проверку.
+⚠️ **Важно:** перед запуском убедись, что `bot.py` и `requirements.txt` уже заменены новыми версиями. Иначе workflow может запустить старый код.
+Если появится красный крестик, пришли мне текст ошибки из журнала выполнения — исправим конкретную проблему.
